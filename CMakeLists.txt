@@ -120,6 +120,8 @@ set(CMAKE_STATIC_LINKER_FLAGS_CHECKED "${CMAKE_STATIC_LINKER_FLAGS_DEBUG}" CACHE
 
 if(WIN32)
   set(XE_PLATFORM_NAME "Windows")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+  set(XE_PLATFORM_NAME "Android")
 elseif(APPLE)
   set(XE_PLATFORM_NAME "macOS")
 else()
@@ -393,6 +395,8 @@ else()
       dl
       pthread
     )
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    link_libraries(android dl log m)
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(NOT XENIA_BUILD_LIBRETRO)
       # GTK3 is only needed by the wx UI, which the libretro core excludes.

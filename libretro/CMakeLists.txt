@@ -57,6 +57,8 @@ target_link_libraries(xenia-libretro PRIVATE
 
 if(XE_TARGET_X86_64)
   target_link_libraries(xenia-libretro PRIVATE xenia-cpu-backend-x64)
+elseif(XE_TARGET_AARCH64)
+  target_link_libraries(xenia-libretro PRIVATE xenia-cpu-backend-a64)
 endif()
 
 if(WIN32)
@@ -67,6 +69,10 @@ if(WIN32)
     target_include_directories(xenia-libretro PRIVATE "$ENV{VULKAN_SDK}/Include")
     target_link_directories(xenia-libretro PRIVATE "$ENV{VULKAN_SDK}/Lib")
   endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+  # Android provides the Vulkan loader as libvulkan.so on API 24+.
+  target_link_libraries(xenia-libretro PRIVATE vulkan)
+  target_link_options(xenia-libretro PRIVATE -Wl,--no-undefined)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # The libretro VK presenter calls Vulkan entry points directly; xenia itself
   # only loads Vulkan dynamically.

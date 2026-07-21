@@ -133,7 +133,7 @@ add_library(discord-rpc STATIC
 )
 if(XE_TARGET_X86_64)
   target_compile_definitions(discord-rpc PRIVATE RAPIDJSON_SSE42)
-elseif(XE_TARGET_ARM64)
+elseif(XE_TARGET_AARCH64)
   target_compile_definitions(discord-rpc PRIVATE RAPIDJSON_NEON)
 endif()
 target_include_directories(discord-rpc PUBLIC discord-rpc/include PRIVATE rapidjson/include)
@@ -190,6 +190,9 @@ target_include_directories(glslang-spirv PUBLIC glslang)
 set(_xe_use_host_shader_cc FALSE)
 if(WIN32 AND CMAKE_CROSSCOMPILING AND XE_TARGET_AARCH64
     AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+  set(_xe_use_host_shader_cc TRUE)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Android")
   set(_xe_use_host_shader_cc TRUE)
 endif()
 # Explicit host tool for other cross setups (e.g. Linux->Windows): a
@@ -448,16 +451,24 @@ else()
 
 # Native x64 build lives at <repo>/build/ (xenia-build.py: get_build_dir(None)).
 set(_xe_host_shader_cc_dir "${CMAKE_SOURCE_DIR}/build/host_tools")
+if(NOT WIN32)
+  set(_xe_host_shader_cc_name "xenia-shader-cc")
+else()
+  set(_xe_host_shader_cc_name "xenia-shader-cc.exe")
+endif()
 set(_xe_host_shader_cc_any "")
+if(EXISTS "${_xe_host_shader_cc_dir}/${_xe_host_shader_cc_name}")
+  set(_xe_host_shader_cc_any "${_xe_host_shader_cc_dir}/${_xe_host_shader_cc_name}")
+endif()
 foreach(_cfg Release Checked Debug)
-  if(EXISTS "${_xe_host_shader_cc_dir}/${_cfg}/xenia-shader-cc.exe")
-    set(_xe_host_shader_cc_any "${_xe_host_shader_cc_dir}/${_cfg}/xenia-shader-cc.exe")
+  if(EXISTS "${_xe_host_shader_cc_dir}/${_cfg}/${_xe_host_shader_cc_name}")
+    set(_xe_host_shader_cc_any "${_xe_host_shader_cc_dir}/${_cfg}/${_xe_host_shader_cc_name}")
     break()
   endif()
 endforeach()
 if(NOT _xe_host_shader_cc_any)
   message(FATAL_ERROR
-    "Cross-compile to ARM64 needs a host xenia-shader-cc.exe but none was found "
+    "Cross-compile needs a host ${_xe_host_shader_cc_name} but none was found "
     "under ${_xe_host_shader_cc_dir}/<Config>/.\n"
     "  Run a native build first to produce it, e.g.:\n"
     "    xb build --target xenia-shader-cc --config=release\n"
@@ -466,9 +477,9 @@ endif()
 add_executable(xenia-shader-cc IMPORTED GLOBAL)
 set_target_properties(xenia-shader-cc PROPERTIES
   IMPORTED_LOCATION "${_xe_host_shader_cc_any}"
-  IMPORTED_LOCATION_RELEASE "${_xe_host_shader_cc_dir}/Release/xenia-shader-cc.exe"
-  IMPORTED_LOCATION_CHECKED "${_xe_host_shader_cc_dir}/Checked/xenia-shader-cc.exe"
-  IMPORTED_LOCATION_DEBUG "${_xe_host_shader_cc_dir}/Debug/xenia-shader-cc.exe")
+  IMPORTED_LOCATION_RELEASE "${_xe_host_shader_cc_any}"
+  IMPORTED_LOCATION_CHECKED "${_xe_host_shader_cc_any}"
+  IMPORTED_LOCATION_DEBUG "${_xe_host_shader_cc_any}")
 
 endif()  # XENIA_HOST_SHADER_CC
 

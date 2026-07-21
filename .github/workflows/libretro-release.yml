@@ -3,6 +3,7 @@ name: libretro-release
 # Builds redistributable libretro core binaries:
 #   - Windows x64: clang-cl + static CRT (no VC++ redistributable needed)
 #   - Linux x64:   clang, bundles libSDL3.so.0 (resolved via $ORIGIN rpath)
+#   - Android ARM64: clang via the Android NDK, for RetroArch arm64-v8a
 # On a v* tag push the zips are attached to a GitHub prerelease; a manual
 # workflow_dispatch run just uploads them as workflow artifacts.
 
@@ -67,6 +68,90 @@ jobs:
         with:
           name: linux-x64
           path: xenia_edge_libretro-linux-x64.zip
+
+  android-arm64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build clang lld zip libvulkan-dev liblz4-dev \
+            libasound2-dev libpulse-dev libudev-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxfixes-dev libxrender-dev libx11-xcb-dev \
+            libxcb1-dev libgl-dev libfontconfig-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: false
+
+      - name: Download Slang shader compiler
+        run: python3 xenia-build.py slang
+
+      - name: Build host shader compiler
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DXENIA_BUILD_LIBRETRO=ON \
+            -DXENIA_ENABLE_LTO=OFF
+          cmake --build build --target xenia-shader-cc
+
+      - name: Configure Android ARM64
+        run: >
+          cmake -S . -B build-android-arm64 -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake
+          -DANDROID_ABI=arm64-v8a
+          -DANDROID_PLATFORM=android-24
+          -DANDROID_STL=c++_static
+          -DCMAKE_BUILD_TYPE=Release
+          -DXENIA_BUILD_LIBRETRO=ON
+          -DXENIA_ENABLE_LTO=OFF
+
+      - name: Generate version.h
+        run: >
+          python3 -c "import importlib.util as u;
+          s = u.spec_from_file_location('xb', 'xenia-build.py');
+          m = u.module_from_spec(s); s.loader.exec_module(m);
+          m.generate_version_h('build-android-arm64')"
+
+      - name: Build Android ARM64 core
+        run: cmake --build build-android-arm64 --target xenia-libretro
+
+      - name: Package
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+            --strip-debug build-android-arm64/bin/Android/xenia_edge_libretro.so
+          mkdir dist
+          cp build-android-arm64/bin/Android/xenia_edge_libretro.so dist/
+          cp libretro/xenia_edge_libretro.info dist/
+          cp LICENSE dist/
+          cat > dist/README-install.txt <<'README'
+          Android RetroArch ARM64 install:
+            xenia_edge_libretro.so   -> RetroArch/cores/
+            xenia_edge_libretro.info -> RetroArch/info/
+
+          This build targets arm64-v8a / Android API 24+ and requires Vulkan.
+          README
+          cd dist
+          zip ../xenia_edge_libretro-android-arm64.zip *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: xenia_edge_libretro-android-arm64.zip
 
   windows-x64:
     runs-on: windows-2022
@@ -192,7 +277,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux-x64, windows-x64]
+    needs: [linux-x64, android-arm64, windows-x64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
