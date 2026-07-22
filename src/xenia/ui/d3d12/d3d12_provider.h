@@ -31,7 +31,10 @@ class D3D12Provider : public GraphicsProvider {
 
   static bool IsD3D12APIAvailable();
 
-  static std::unique_ptr<D3D12Provider> Create();
+  // fatal_on_failure shows the blocking error dialog on initialization
+  // failure; pass false to probe availability (e.g. to pick a fallback
+  // backend) with only log output.
+  static std::unique_ptr<D3D12Provider> Create(bool fatal_on_failure = true);
 
   std::unique_ptr<Presenter> CreatePresenter(
       Presenter::HostGpuLossCallback host_gpu_loss_callback =
@@ -138,10 +141,21 @@ class D3D12Provider : public GraphicsProvider {
   uint16_t GetHighestShaderModel() const { return highest_shader_model_; }
 
   // Proxies for DirectX functions since they are loaded dynamically.
+  // Serialization must go through the same runtime the device came from: the
+  // D3D12SerializeRootSignature export always runs the in-box runtime, which
+  // on Windows 10 predates the SM 6.6 bindless heap-directly-indexed root
+  // signature flags and rejects them ("unsupported bit-flag set").
   HRESULT SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* desc,
                                  D3D_ROOT_SIGNATURE_VERSION version,
                                  ID3DBlob** blob_out,
                                  ID3DBlob** error_blob_out) const {
+    if (device_configuration_ && version == D3D_ROOT_SIGNATURE_VERSION_1) {
+      D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned;
+      versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+      versioned.Desc_1_0 = *desc;
+      return device_configuration_->SerializeVersionedRootSignature(
+          &versioned, blob_out, error_blob_out);
+    }
     return pfn_d3d12_serialize_root_signature_(desc, version, blob_out,
                                                error_blob_out);
   }
@@ -206,6 +220,16 @@ class D3D12Provider : public GraphicsProvider {
   // resolves to the copy in the D3D12 folder. May be nullptr (system-wide
   // dxil.dll, if any, still resolves on dxcompiler's own).
   HMODULE library_dxil_ = nullptr;
+
+  // Non-null when the bundled Agility SDK runtime was side-loaded from the
+  // D3D12 directory; devices must then be created through it so they use that
+  // runtime instead of the in-box one (which lacks Shader Model 6.6 before
+  // Windows 11).
+  ID3D12DeviceFactory* device_factory_ = nullptr;
+  // Routes root-signature serialization to the runtime the device came from
+  // (see SerializeRootSignature). May be null on runtimes that predate it -
+  // the in-box export is used then.
+  ID3D12DeviceConfiguration* device_configuration_ = nullptr;
 
   IDXGIFactory2* dxgi_factory_ = nullptr;
   ID3D12Device* device_ = nullptr;

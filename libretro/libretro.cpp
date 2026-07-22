@@ -21,6 +21,7 @@
 #include "libretro_vulkan.h"
 #ifdef _WIN32
 #include "libretro_d3d12.h"
+#include <timeapi.h>  // timeBeginPeriod/timeEndPeriod (link: winmm)
 #endif
 #include "libretro_core_options.h"
 
@@ -72,6 +73,7 @@ DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(disable_context_promotion);
 #ifdef _WIN32
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
+#include "xenia/ui/d3d12/d3d12_provider.h"
 #endif
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #include "xenia/ui/presenter.h"
@@ -789,8 +791,26 @@ static plm_t* splash_plm = nullptr;
 static std::vector<uint8_t> splash_frame_buf;
 static int splash_w = 0, splash_h = 0;
 static bool splash_audio_ok = false;
-static std::chrono::steady_clock::time_point splash_next_frame;
+static std::chrono::steady_clock::time_point splash_next_tick;
+static std::chrono::steady_clock::time_point splash_t0;
 static bool splash_pacing_init = false;
+static bool splash_audio_done = false;
+static double splash_video_time = -1.0;  // PTS of the frame currently shown
+// Presentation clock in seconds: fed-audio duration while audio plays (the
+// frontend's audio sync turns that into real time), wall-tick advanced after
+// the audio ends or when there is none.
+static double splash_clock = 0.0;
+static int64_t splash_samples_fed = 0;
+static double splash_sample_accum = 0.0;
+// Decoded-PCM carry between runs (an MP2 frame rarely divides evenly into
+// the per-run sample count).
+static std::vector<int16_t> splash_pcm_carry;
+static size_t splash_pcm_carry_pos = 0;
+// Diagnostics reported when the splash ends, to tell buffer-full pacing
+// (blocked writes: normal) from starvation (long tick gaps: the crackle).
+static int splash_blocked_writes = 0;
+static double splash_max_tick_gap = 0.0;
+static std::chrono::steady_clock::time_point splash_last_tick;
 // "Before Boot" splash mode: the game launch is deferred until the video
 // ends (or is skipped), then performed from retro_run.
 static bool launch_pending = false;
@@ -801,6 +821,10 @@ static void splash_stop(void) {
     if (splash_plm) {
         plm_destroy(splash_plm);
         splash_plm = nullptr;
+        xenia_log(RETRO_LOG_INFO,
+                  "Boot splash ended: %d blocked audio writes, max tick gap "
+                  "%.1f ms\n",
+                  splash_blocked_writes, splash_max_tick_gap * 1000.0);
     }
     splash_frame_buf.clear();
     splash_frame_buf.shrink_to_fit();
@@ -867,40 +891,118 @@ static bool splash_run_frame(void) {
         return false;
     }
 
+    // The splash behaves like a standard libretro core: every retro_run
+    // outputs one video frame plus exactly one frame's worth of audio, and
+    // the FRONTEND does all pacing (audio_sync blocks the write while its
+    // buffer is full - the same mechanism that plays in-game audio cleanly).
+    // No wall-clock scheduling of audio at all; the wall clock is only a
+    // runaway guard for frontends that don't pace, and the tick sleep only
+    // paces audio-less splashes. Video follows the fed-audio clock.
     using clock = std::chrono::steady_clock;
     if (!splash_pacing_init) {
-        splash_next_frame = clock::now();
         splash_pacing_init = true;
+        splash_t0 = clock::now();
+        splash_next_tick = splash_t0;
+        splash_last_tick = splash_t0;
+        splash_clock = 0.0;
+        splash_samples_fed = 0;
+        splash_sample_accum = 0.0;
+        splash_pcm_carry.clear();
+        splash_pcm_carry_pos = 0;
+        splash_audio_done = !splash_audio_ok;
+        splash_video_time = -1.0;
+        splash_blocked_writes = 0;
+        splash_max_tick_gap = 0.0;
+    }
+    {
+        auto now = clock::now();
+        double gap =
+            std::chrono::duration<double>(now - splash_last_tick).count();
+        if (gap > splash_max_tick_gap) splash_max_tick_gap = gap;
+        splash_last_tick = now;
     }
 
-    plm_frame_t* frame = plm_decode_video(splash_plm);
-    if (!frame) {
-        splash_stop();
-        return false;
-    }
+    const double av_fps = core_state.pal_mode ? 50.0 : 60.0;
+    double elapsed =
+        std::chrono::duration<double>(clock::now() - splash_t0).count();
 
-    plm_frame_to_bgra(frame, splash_frame_buf.data(), splash_w * 4);
-
-    // Feed splash audio, keeping a lead ahead of the video position. The
-    // per-frame video pacing below blocks retro_run for ~1 frame, during which
-    // the frontend's audio buffer would otherwise drain to empty and crackle;
-    // decoding ~100 ms ahead keeps a cushion buffered across the sleep.
-    if (splash_audio_ok) {
-        static int16_t s16[PLM_AUDIO_SAMPLES_PER_FRAME * 2];
-        constexpr double kAudioLeadSeconds = 0.10;
-        while (true) {
-            plm_samples_t* s = plm_decode_audio(splash_plm);
-            if (!s) break;
-            for (unsigned i = 0; i < s->count * 2; i++) {
-                float f = s->interleaved[i] * 32767.0f;
-                if (f > 32767.0f) f = 32767.0f;
-                if (f < -32768.0f) f = -32768.0f;
-                s16[i] = (int16_t)f;
+    bool paced_by_audio = false;
+    if (!splash_audio_done && splash_clock <= elapsed + 0.1) {
+        // Assemble this run's chunk (sample_rate / fps, fraction carried).
+        splash_sample_accum += core_state.audio_sample_rate / av_fps;
+        size_t need = (size_t)splash_sample_accum;  // stereo frames
+        splash_sample_accum -= (double)need;
+        static std::vector<int16_t> chunk;
+        chunk.clear();
+        while (need) {
+            if (splash_pcm_carry_pos >= splash_pcm_carry.size()) {
+                plm_samples_t* s = plm_decode_audio(splash_plm);
+                if (!s) {
+                    splash_audio_done = true;
+                    break;
+                }
+                splash_pcm_carry.resize(s->count * 2);
+                for (unsigned i = 0; i < s->count * 2; i++) {
+                    float f = s->interleaved[i] * 32767.0f;
+                    if (f > 32767.0f) f = 32767.0f;
+                    if (f < -32768.0f) f = -32768.0f;
+                    splash_pcm_carry[i] = (int16_t)f;
+                }
+                splash_pcm_carry_pos = 0;
             }
-            if (core_state.audio_batch_cb)
-                core_state.audio_batch_cb(s16, s->count);
-            if (s->time >= frame->time + kAudioLeadSeconds) break;
+            size_t have = (splash_pcm_carry.size() - splash_pcm_carry_pos) / 2;
+            size_t take = have < need ? have : need;
+            chunk.insert(chunk.end(),
+                         splash_pcm_carry.begin() + splash_pcm_carry_pos,
+                         splash_pcm_carry.begin() + splash_pcm_carry_pos +
+                             take * 2);
+            splash_pcm_carry_pos += take * 2;
+            need -= take;
         }
+        if (!chunk.empty()) {
+            auto write_start = clock::now();
+            if (core_state.audio_batch_cb)
+                core_state.audio_batch_cb(chunk.data(), chunk.size() / 2);
+            if (std::chrono::duration<double>(clock::now() - write_start)
+                    .count() > 0.004) {
+                ++splash_blocked_writes;  // buffer-full pacing; expected.
+            }
+            splash_samples_fed += (int64_t)(chunk.size() / 2);
+            splash_clock =
+                (double)splash_samples_fed / core_state.audio_sample_rate;
+            paced_by_audio = true;
+        }
+    }
+
+    if (!paced_by_audio) {
+        // No audio delivered this run (none in the stream, it ended, or the
+        // runaway guard tripped): pace one tick ourselves.
+        auto now = clock::now();
+        if (now < splash_next_tick) {
+            std::this_thread::sleep_until(splash_next_tick);
+        }
+        splash_next_tick += std::chrono::nanoseconds(
+            core_state.pal_mode ? 20000000 : 16666667);
+        if (splash_next_tick < clock::now() - std::chrono::milliseconds(200))
+            splash_next_tick = clock::now();
+        if (splash_audio_done) {
+            splash_clock += 1.0 / av_fps;
+        }
+    } else {
+        // Keep the fallback tick anchored so it doesn't burst when audio ends.
+        splash_next_tick = clock::now();
+    }
+
+    // Decode video up to the presentation clock (typically 0 or 1 frames per
+    // run; late frames are caught up by decoding through them).
+    while (splash_video_time < splash_clock) {
+        plm_frame_t* frame = plm_decode_video(splash_plm);
+        if (!frame) {
+            splash_stop();
+            return false;
+        }
+        splash_video_time = frame->time;
+        plm_frame_to_bgra(frame, splash_frame_buf.data(), splash_w * 4);
     }
 
     // Discard the booting game's audio so it doesn't burst in afterwards.
@@ -910,24 +1012,15 @@ static bool splash_run_frame(void) {
         }
     }
 
-    // Pace to the video's own framerate.
-    auto now = clock::now();
-    if (now < splash_next_frame) {
-        std::this_thread::sleep_until(splash_next_frame);
-    }
-    splash_next_frame += std::chrono::nanoseconds(
-        (int64_t)(1e9 / plm_get_framerate(splash_plm)));
-    if (splash_next_frame < clock::now() - std::chrono::milliseconds(200))
-        splash_next_frame = clock::now();
-
     core_state.video_cb(splash_frame_buf.data(), splash_w, splash_h,
                         splash_w * 4);
     return true;
 }
 
-// Pace software-mode retro_run to content rate. Frontends that disable both
-// vsync and audio sync (EmuVR's config does) call retro_run in a free spin,
-// which turns the per-frame CaptureGuestOutput readback into a GPU flood.
+// Pace software-mode retro_run to content rate. EmuVR's config turns vsync
+// off, and audio sync only throttles while the core is actually delivering
+// audio - during loads/silence retro_run free-spins, which turns the
+// per-frame CaptureGuestOutput readback into a GPU flood.
 // Under a normally throttled frontend the deadline is already past and this
 // is a no-op.
 static void pace_software_frame(void) {
@@ -1246,13 +1339,63 @@ static bool xenia_setup_and_launch(const char *path) {
     try {
         namespace fs = std::filesystem;
         fs::path storage = fs::path(core_state.save_dir);
-        fs::path content = fs::path(core_state.system_dir);
+        // Guest content (profiles, DLC, title updates) lives under
+        // system/xenia - as content_root directly in the frontend's shared
+        // system dir, its XUID-named folders (E0..../0000000000000000)
+        // confused users browsing a dir many cores share.
+        fs::path content = fs::path(core_state.system_dir) / "xenia";
         fs::path cache   = fs::path(core_state.save_dir) / "cache";
         fs::path cmdline = fs::path(path);
 
         std::error_code ec;
         fs::create_directories(cache, ec);
         fs::create_directories(storage, ec);
+        fs::create_directories(content, ec);
+
+        // Migrate content from builds that mounted the system dir root:
+        // XUID-named folders (16 hex chars) are ours - move them under
+        // system/xenia so existing profiles, saves and DLC keep working.
+        {
+            std::vector<fs::path> old_dirs;
+            std::error_code iter_ec;
+            for (const auto& entry : fs::directory_iterator(
+                     fs::path(core_state.system_dir), iter_ec)) {
+                if (!entry.is_directory(iter_ec)) continue;
+                std::string name = entry.path().filename().string();
+                if (name.size() != 16 ||
+                    name.find_first_not_of("0123456789abcdefABCDEF") !=
+                        std::string::npos) {
+                    continue;
+                }
+                old_dirs.push_back(entry.path());
+            }
+            for (const auto& old_dir : old_dirs) {
+                fs::path new_dir = content / old_dir.filename();
+                std::error_code mig_ec;
+                if (fs::exists(new_dir, mig_ec)) {
+                    xenia_log(RETRO_LOG_WARN,
+                              "Guest content exists both at %s and %s; using "
+                              "the latter, merge or remove the former "
+                              "manually\n",
+                              old_dir.string().c_str(),
+                              new_dir.string().c_str());
+                    continue;
+                }
+                fs::rename(old_dir, new_dir, mig_ec);
+                if (mig_ec) {
+                    xenia_log(RETRO_LOG_WARN,
+                              "Failed to move guest content %s to %s: %s\n",
+                              old_dir.string().c_str(),
+                              new_dir.string().c_str(),
+                              mig_ec.message().c_str());
+                } else {
+                    xenia_log(RETRO_LOG_INFO,
+                              "Moved guest content %s to %s\n",
+                              old_dir.string().c_str(),
+                              new_dir.string().c_str());
+                }
+            }
+        }
         // Initialize Xenia logging first
 #ifdef _WIN32
         xe::InitializeWin32App("xenia_libretro");
@@ -1460,6 +1603,13 @@ RETRO_API void retro_set_input_poll(retro_input_poll_t cb)            { core_sta
 RETRO_API void retro_set_input_state(retro_input_state_t cb)          { core_state.input_state_cb = cb; }
 
 RETRO_API void retro_init(void) {
+#ifdef _WIN32
+    // The splash and software-present pacing sleep in ~17 ms ticks; without
+    // this the Windows default 15.6 ms timer granularity makes each sleep
+    // overshoot by up to a full tick. Per-process since Windows 10 2004, so
+    // the frontend's own resolution is unaffected.
+    timeBeginPeriod(1);
+#endif
     core_state.audio_sample_rate  = 48000.0;
     core_state.audio_buffer_size  = 4096;   // int16 values (2048 stereo frames)
     core_state.audio_buffer       = static_cast<int16_t *>(
@@ -1477,6 +1627,9 @@ RETRO_API void retro_deinit(void) {
     free(core_state.audio_buffer);
     core_state.audio_buffer = nullptr;
 
+#ifdef _WIN32
+    timeEndPeriod(1);
+#endif
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info) {
@@ -1609,17 +1762,29 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         }
     }
 #ifdef _WIN32
-    // Safety net: D3D12 without its Agility runtime can't initialize the
-    // graphics subsystem (fails outright, black screen). Fall back to the
-    // self-contained Vulkan backend so the core still works.
-    if (strcmp(core_state.graphics_backend, XENIA_GRAPHICS_D3D12) == 0 &&
-        !d3d12_runtime_available()) {
-        xenia_log(RETRO_LOG_WARN,
-                  "D3D12 selected but D3D12/D3D12Core.dll was not found next to "
-                  "the frontend; falling back to Vulkan\n");
-        strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
-                sizeof(core_state.graphics_backend) - 1);
-        preferred_hw = RETRO_HW_CONTEXT_NONE;
+    // Safety net: D3D12 needs its Agility runtime next to the frontend AND an
+    // OS/driver combination that actually delivers Shader Model 6.6. Probe the
+    // full provider initialization once here; on any failure fall back to the
+    // self-contained Vulkan backend so the core still works instead of dying
+    // with a fatal error dialog.
+    if (strcmp(core_state.graphics_backend, XENIA_GRAPHICS_D3D12) == 0) {
+        const char* d3d12_fail_reason = nullptr;
+        if (!d3d12_runtime_available()) {
+            d3d12_fail_reason = "D3D12/D3D12Core.dll was not found next to the "
+                                "frontend";
+        } else if (!xe::ui::d3d12::D3D12Provider::Create(
+                       /*fatal_on_failure=*/false)) {
+            d3d12_fail_reason = "the Direct3D 12 graphics subsystem failed to "
+                                "initialize (see the xenia log for details)";
+        }
+        if (d3d12_fail_reason) {
+            xenia_log(RETRO_LOG_WARN,
+                      "D3D12 selected but %s; falling back to Vulkan\n",
+                      d3d12_fail_reason);
+            strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
+                    sizeof(core_state.graphics_backend) - 1);
+            preferred_hw = RETRO_HW_CONTEXT_NONE;
+        }
     }
 #endif
     // Also update the gpu cvar so internal Xenia code stays consistent
