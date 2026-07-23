@@ -74,15 +74,16 @@ struct string_key_insensitive : internal::string_key_base {
   }
 
   bool operator==(const string_key_insensitive& other) const {
-    return other.view().size() == view().size() &&
-           std::ranges::equal(
-               other.view(), view(), {},
-               [](char ch) {
-                 return std::tolower(static_cast<unsigned char>(ch));
-               },
-               [](char ch) {
-                 return std::tolower(static_cast<unsigned char>(ch));
-               });
+    if (other.view().size() != view().size()) {
+      return false;
+    }
+    for (size_t i = 0; i < view().size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(other.view()[i])) !=
+          std::tolower(static_cast<unsigned char>(view()[i]))) {
+        return false;
+      }
+    }
+    return true;
   }
 
   size_t hash() const { return utf8::hash_fnv1a(view()); }

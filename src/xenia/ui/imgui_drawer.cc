@@ -11,7 +11,6 @@
 
 #include <cfloat>
 #include <cstring>
-#include <ranges>
 
 #include "embedded_font.h"
 #include "third_party/imgui/imgui.h"
@@ -718,25 +717,32 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   dialog_loop_next_index_ = SIZE_MAX;
 
   if (!notifications_.empty() && are_notifications_enabled_) {
-    auto guest_notifications =
-        notifications_ | std::views::filter([](auto* notification) {
-          return notification->GetNotificationType() == NotificationType::Guest;
-        });
+    ImGuiNotification* first_guest = nullptr;
+    ImGuiNotification* first_host = nullptr;
+    size_t host_count = 0;
 
-    auto host_notifications =
-        notifications_ | std::views::filter([](auto* notification) {
-          return notification->GetNotificationType() == NotificationType::Host;
-        });
-
-    if (!guest_notifications.empty()) {
-      guest_notifications.front()->Draw();
+    for (auto* notification : notifications_) {
+      if (notification->GetNotificationType() == NotificationType::Guest) {
+        if (!first_guest) {
+          first_guest = notification;
+        }
+      } else if (notification->GetNotificationType() == NotificationType::Host) {
+        ++host_count;
+        if (!first_host) {
+          first_host = notification;
+        }
+      }
     }
 
-    if (!host_notifications.empty()) {
-      host_notifications.front()->Draw();
+    if (first_guest) {
+      first_guest->Draw();
+    }
 
-      if (std::ranges::distance(host_notifications) > 1) {
-        host_notifications.front()->SetDeletionPending();
+    if (first_host) {
+      first_host->Draw();
+
+      if (host_count > 1) {
+        first_host->SetDeletionPending();
       }
     }
   }
