@@ -62,6 +62,12 @@
 #define XE_HAS_SIGEV_THREAD_ID 0
 #endif
 
+#if XE_PLATFORM_GNU_LINUX
+#define XE_HAS_PTHREAD_ROBUST_MUTEX 1
+#else
+#define XE_HAS_PTHREAD_ROBUST_MUTEX 0
+#endif
+
 namespace xe {
 namespace threading {
 
@@ -271,7 +277,7 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if !XE_PLATFORM_MAC
+#if XE_HAS_PTHREAD_ROBUST_MUTEX
     // Initialize as robust mutex to handle thread termination gracefully.
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -291,8 +297,8 @@ class PosixConditionBase {
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
-#if XE_PLATFORM_MAC
-    // Standard locking on macOS (no robust mutex support).
+#if !XE_HAS_PTHREAD_ROBUST_MUTEX
+    // Standard locking on platforms with no robust mutex support.
     std::unique_lock<std::mutex> lock(mutex_);
 #else
     // Handle robust mutex locking.
@@ -358,8 +364,8 @@ class PosixConditionBase {
       bool all_locked = true;
 
       for (size_t i = 0; i < handles.size(); ++i) {
-#if XE_PLATFORM_MAC
-        // macOS: no robust mutex support.
+#if !XE_HAS_PTHREAD_ROBUST_MUTEX
+        // Platforms with no robust mutex support.
         std::unique_lock<std::mutex> lk(handles[i]->mutex_, std::try_to_lock);
         if (!lk.owns_lock()) {
           all_locked = false;
@@ -367,7 +373,7 @@ class PosixConditionBase {
         }
         locks.emplace_back(std::move(lk));
 #else
-        // Linux/Android: robust-aware trylock.
+        // Robust-aware trylock.
         auto native_mutex =
             static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
         int result = pthread_mutex_trylock(native_mutex);
@@ -853,7 +859,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   }
 
 #if XE_PLATFORM_ANDROID
-  void SetAndroidPreApi26Name(const std::string_view name) {
+  void SetAndroidPreApi26Name(const std::string_view name) const {
     if (android_pthread_getname_np_) {
       return;
     }
@@ -1208,7 +1214,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   // Name accessible via name() on Android before API 26 which added
   // pthread_getname_np.
   mutable std::mutex android_pre_api_26_name_mutex_;
-  char android_pre_api_26_name_[16];
+  mutable char android_pre_api_26_name_[16];
 #endif
 };
 
